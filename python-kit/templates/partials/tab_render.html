@@ -1,0 +1,33 @@
+<div class="bg-slate-900 border border-slate-800 rounded-lg p-6 space-y-5 max-w-2xl mx-auto">
+  <div class="flex items-center justify-between">
+    <div>
+      <h2 class="text-base font-semibold text-slate-100">Final MP4 Assembly</h2>
+      <p class="text-xs text-slate-400">ffmpeg H.264/AAC · Ken Burns + Captions + Ducking + Watermark</p>
+    </div>
+    <span class="text-xs font-mono text-amber-400" x-text="outputProfile"></span>
+  </div>
+
+  <div class="flex gap-3">
+    <button type="button" @click="startRender(false)" :disabled="busy.render" class="flex-1 py-2.5 px-4 rounded bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold text-sm disabled:opacity-50">
+      Render Full Episode MP4
+    </button>
+    <button type="button" @click="startRender(true)" :disabled="busy.render" class="py-2.5 px-4 rounded border border-slate-700 hover:bg-slate-800 text-sm">
+      3s Preview
+    </button>
+  </div>
+
+  <div x-show="renderProgress.jobId" class="space-y-2">
+    <div class="flex justify-between text-xs font-mono text-slate-300">
+      <span x-text="renderProgress.message"></span>
+      <span x-text="`${renderProgress.progress}%`"></span>
+    </div>
+    <div class="w-full h-2 bg-slate-800 rounded overflow-hidden">
+      <div class="h-full bg-amber-500 transition-all" :style="`width: ${renderProgress.progress}%`"></div>
+    </div>
+  </div>
+
+  <div x-show="lastRenderUrl" class="pt-3 border-t border-slate-800 flex items-center justify-between">
+    <span class="text-xs font-mono text-emerald-400">Latest Master Ready</span>
+    <a :href="lastRenderUrl" download class="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-100">Download MP4</a>
+  </div>
+</div>

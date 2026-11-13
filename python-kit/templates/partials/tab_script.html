@@ -1,0 +1,70 @@
+<div class="space-y-6">
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <section class="bg-slate-900 border border-slate-800 rounded-lg p-5 space-y-4">
+      <h2 class="text-sm font-semibold text-slate-100">Script Parameters</h2>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Genre</label>
+        <input x-model="scriptForm.genre" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm" />
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Tone</label>
+        <input x-model="scriptForm.tone" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm" />
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Duration (sec)</label>
+          <input type="number" x-model.number="scriptForm.duration" min="15" max="300" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm font-mono" />
+        </div>
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Format</label>
+          <select x-model="outputProfile" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm">
+            <option value="9x16">9:16 Vertical</option>
+            <option value="16x9">16:9 Widescreen</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Characters (comma-separated)</label>
+        <input x-model="scriptForm.characters" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm" />
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Chapter / Arc Instructions</label>
+        <textarea x-model="scriptForm.extra" rows="3" class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm"></textarea>
+      </div>
+      <button
+        type="button"
+        @click="generateScript()"
+        :disabled="busy.script"
+        class="w-full py-2 px-4 rounded bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold text-sm disabled:opacity-50"
+        x-text="busy.script ? 'Generating Script...' : 'Generate Script (Gemini)'"
+      ></button>
+
+      <div class="pt-3 border-t border-slate-800 space-y-2">
+        <label class="block text-xs text-slate-400">Import Web Studio Bundle (.zip)</label>
+        <input type="file" accept=".zip" @change="importBundle($event)" class="block w-full text-xs text-slate-400" />
+      </div>
+    </section>
+
+    <section class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-lg p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-slate-100" x-text="script ? script.title : 'Scene Beats'"></h2>
+        <span class="text-xs font-mono text-slate-400" x-text="script ? `${script.scenes.length} scenes · ${script.duration_seconds}s` : 'No script loaded'"></span>
+      </div>
+      <template x-if="!script">
+        <p class="text-sm text-slate-400 py-8 text-center">Generate a script or import a Web Studio Project Bundle (.zip) to begin.</p>
+      </template>
+      <div class="space-y-3 max-h-[540px] overflow-y-auto pr-1" x-show="script">
+        <template x-for="(scene, idx) in (script?.scenes || [])" :key="scene.id">
+          <div class="bg-slate-950 border border-slate-800 rounded p-3 space-y-2">
+            <div class="flex items-center justify-between text-xs font-mono text-slate-400">
+              <span x-text="`SCENE ${scene.id} · ${scene.beat.toUpperCase()} · ${scene.speaker}`"></span>
+              <span x-text="`${scene.duration_seconds}s · ${scene.camera}`"></span>
+            </div>
+            <textarea x-model="scene.narration" rows="2" class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-sm"></textarea>
+            <input x-model="scene.visual_direction" class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300" />
+          </div>
+        </template>
+      </div>
+    </section>
+  </div>
+</div>

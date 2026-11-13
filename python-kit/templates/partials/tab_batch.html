@@ -1,0 +1,24 @@
+<div class="bg-slate-900 border border-slate-800 rounded-lg p-6 space-y-5 max-w-3xl mx-auto">
+  <div>
+    <h2 class="text-base font-semibold text-slate-100">Batch Episode Queue (JSON / CSV Manifest)</h2>
+    <p class="text-xs text-slate-400">Processes N episodes concurrently via ProcessPoolExecutor and bundles MP4 + SRT files into a ZIP archive.</p>
+  </div>
+  <input type="file" accept=".json,.csv" @change="runBatch($event.target.files[0])" class="block w-full text-sm text-slate-300" />
+
+  <template x-if="batchSummary">
+    <div class="space-y-3 border-t border-slate-800 pt-4">
+      <div class="flex items-center justify-between text-xs font-mono">
+        <span x-text="`Completed ${batchSummary.succeeded}/${batchSummary.total} episodes`"></span>
+        <a :href="batchSummary.zip_url" class="px-3 py-1.5 rounded bg-amber-600 text-slate-950 font-sans font-semibold">Download All (ZIP)</a>
+      </div>
+      <div class="space-y-1 text-xs font-mono text-slate-300">
+        <template x-for="item in batchSummary.results" :key="item.job_id">
+          <div class="flex justify-between bg-slate-950 border border-slate-800 rounded px-3 py-1.5">
+            <span x-text="item.job_id"></span>
+            <span x-text="item.status"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+  </template>
+</div>

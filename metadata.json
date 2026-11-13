@@ -1,0 +1,6 @@
+{
+  "name": "Passions Peak Studio",
+  "description": "Multi-project micro-drama production studio and portable Python pipeline for vertical 9:16 and widescreen 16:9 serialized storytelling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

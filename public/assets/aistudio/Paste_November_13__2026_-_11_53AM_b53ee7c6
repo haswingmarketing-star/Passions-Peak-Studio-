@@ -1,0 +1,353 @@
+# Architectural Review: Passions Peak Production Studio
+
+I'll approach this the way I'd approach any system review: first by identifying what the architecture is actually *responsible for*, then checking whether the components, boundaries, and data ownership match those responsibilities. Your design is solid in intent — the real issues are about **boundaries, lifecycles, and missing contracts**, not about the feature set.
+
+---
+
+## Part 1: What the system is really doing (the lens for the review)
+
+Strip away the UI and this system has five distinct jobs, each with a different lifecycle:
+
+| Concern | Lifecycle | Mutability | Who owns the truth |
+|---|---|---|---|
+| **Canon** (bible, roster, refs, completed chapters, Who-Knows-What) | Series-long, grows across episodes | Append-mostly, must be versioned | Server |
+| **Episode draft** (active script, scenes, prompts) | One episode, hours–days | Highly mutable | Client during editing, server on save |
+| **Generated media** (frames, audio, thumbnails) | Permanent once approved | Immutable blobs | Asset store |
+| **Jobs** (generation, batch, render) | Seconds–minutes, must survive refresh | Transient but durable | Server |
+| **Portable pipeline** (Python kit) | Independent release cadence | Versioned artifact | Build/release |
+
+Your current diagram collapses several of these into single boxes. Most of the recommendations below come from pulling them apart.
+
+---
+
+## Part 2: What should change and why
+
+### 1. The "Central Project Store" is a god object with three different lifecycles inside it
+
+**Problem:** It holds canon (series-long, versioned), active episode (draft), *and* the render/batch queue (transient job state) in one client-side store. The queue living in the browser is the most dangerous part: close the tab mid-batch and the client's picture of job state is gone, and the server has no authoritative record either.
+
+**Change:** Split into three stores with different sync strategies:
+- **Canon Cache** — read-mostly mirror of server canon, pinned to a `bibleVersion`
+- **Episode Workspace** — the only truly client-owned draft state, autosaved
+- **Job Mirror** — a *subscription* to server job state, never the source of truth
+
+**Why:** Each has different persistence, conflict, and recovery requirements. Mixing them means a bug in draft-handling can corrupt canon, and a refresh can orphan jobs.
+
+### 2. Canon mutations have no versioning or audit trail
+
+**Problem:** "Complete Chapter & Carry Forward" writes new facts and Who-Knows-What rows directly into the bible. There's no record of *which canon version* an episode was generated against, so the Canon Audit can't say "this contradicts a fact introduced in Chapter 4," and you can't roll back a bad carry-forward.
+
+**Change:** Introduce a **Canon & Continuity Service** that:
+- Treats Who-Knows-What as an **append-only ledger** (`{chapterId, characterId, factId, knows: true/false, revealedInScene}`)
+- Stamps every episode with `bibleVersion` at script-generation time
+- Makes "Carry Forward" a reviewable diff (proposed facts → accepted facts → new version)
+
+**Why:** Serialized drama lives and dies on continuity. A ledger makes the audit deterministic rather than a vibes-based LLM pass, and versioning makes mistakes recoverable.
+
+### 3. Character detection happens too late (at image generation)
+
+**Problem:** The pre-flight check over `charactersPresent[]` fires when you click "generate scene image." By then the script is written, narration is assigned, and voice IDs may be missing. Also, there's no alias resolution — "Marcus," "Det. Reyes," and "the detective" can become three characters.
+
+**Change:** Make **Character Registry** a first-class domain service, invoked in two places:
+- **At script generation** (detection + alias resolution against roster, flagging unregistered)
+- **At the Continuity Gate** (blocking approval before any visual generation)
+
+Add `aliases[]` to the character model and a resolver that maps mentions → canonical `characterId`. Keep the "adult characters only" rule as an enforced **policy in the service**, not just a prompt instruction.
+
+**Why:** Onboarding is a canon event, not an asset-generation side effect. Catching it early means voice casting, wardrobe, and refs are all resolved before you spend image credits.
+
+### 4. "Reference-first continuity" needs a deterministic prompt assembler and provenance
+
+**Problem:** Right now, `approvedRefUrl` is the only continuity artifact. But a scene's visual identity depends on character refs + location plate + city color grade + wardrobe + aspect. If those are assembled ad hoc in the Gemini Gateway, you'll get drift, and you can't reproduce a frame later.
+
+**Change:** Add a **Continuity Pack** assembled per scene by the Visual Service:
+```
+ContinuityPack {
+  characterRefs: [{characterId, refAssetId, wardrobeId}],
+  locationPlateId, colorGradeId,
+  outputProfile: "9x16" | "16x9",
+  negativeConstraints[]
+}
+```
+And store **provenance** on every generated frame: `{model, promptHash, continuityPackHash, refAssetIds[], seed, createdAt}`.
+
+**Why:** Deterministic assembly = consistent look. Provenance = you can regenerate, debug, and prove to yourself why a frame looks the way it does.
+
+### 5. Aspect ratio is modeled as a global toggle, but it's really an output profile
+
+**Problem:** `Aspect (9:16 | 16:9)` in the store implies one global mode. But a 9:16 micro-drama and a 16:9 episode of the same chapter need different framing, different thumbnails, different motion prompts (vertical camera moves differ), and often different scene cuts. A toggle that reinterprets stored assets will cause silent mismatches.
+
+**Change:** Model **Output Profile** as a property of generated assets and render manifests, not a mode. An episode can have `renderTargets: ["9x16", "16x9"]`, and every frame/thumbnail/manifest carries its profile.
+
+**Why:** Avoids the bug class where you render a 16:9 episode with 9:16 frames, and makes dual-format a feature rather than a hazard.
+
+### 6. Two render engines with no shared contract
+
+**Problem:** The browser does "Canvas + Export"; the Python kit does MoviePy + ffmpeg. These are two renderers that will diverge unless they consume the *same input*. Today, nothing in the diagram defines that input.
+
+**Change:** Introduce the **Episode Render Manifest** — a versioned JSON document that is the single handoff artifact:
+```
+RenderManifest v1 {
+  episodeId, bibleVersion, outputProfile,
+  scenes: [{ id, frameAssetId, audioAssetId, srtAssetId, durationMs,
+             motionPrompt, transitionOut }],
+  thumbnails: [...], fonts/colorGrade, kitSchemaVersion
+}
+```
+The browser Canvas renders it as a **preview**; the Python kit renders it as **production**. Both validate against the same schema.
+
+**Why:** This is the most important missing piece. It decouples the studio from the kit, lets you evolve either independently, and makes the "creators worldwide" promise real — they get a manifest + assets, not a dependency on your running server.
+
+### 7. Provider calls and domain logic are fused in the "Gemini Gateway"
+
+**Problem:** The gateway box contains both *how to call Gemini* and *what a script generation is*. When Gemini changes a model name, adds image-gen limits, or you want to try another provider for images, you're editing domain code.
+
+**Change:** Separate **Domain Services** (Script, Canon, Character, Visual, Voice, Export, Kit) from **Provider Adapters** (Gemini text/image/TTS, ElevenLabs, Whisper). Adapters own retries, rate-limits, cost accounting, and response normalization. Services own the workflow.
+
+**Why:** Swappability, testability (mock adapters), and one place for cost/usage telemetry — which matters a lot in an image-heavy pipeline.
+
+### 8. Misplaced components
+
+- **Motion .txt Compiler** is under "Audio & Media Proxy." It's a pure, deterministic formatter over the scene schema — it belongs in an **Export Service** (and could even run client-side).
+- **"GitHub Hygiene"** isn't a runtime component; it's a repo practice. Replace it with something enforceable: a **Secret Scrub Gate** in the Kit Service that scans the ZIP for key patterns and fails the build if any match, backed by a test.
+- **Audio & Media Proxy** mixes TTS, transcription, and text formatting. Split into **Voice Service** (casting + synthesis) and **Transcription** (Whisper → SRT), both behind adapters.
+
+### 9. Voice casting is provider-ambiguous
+
+**Problem:** `defaultVoiceId` on a character is meaningless without knowing which provider — ElevenLabs voice IDs and Gemini TTS voice names aren't interchangeable, and the kit may use Edge-TTS.
+
+**Change:** `voiceProfile: { elevenlabs?: id, gemini?: name, edgeTts?: name, style?: {...} }` with a **Voice Map** resolver in the Voice Service.
+
+**Why:** Lets you swap providers per environment (hosted studio vs. local kit) without recasting.
+
+### 10. Jobs aren't durable and SSE is per-job
+
+**Problem:** "Batch Worker Queue" lives in the Express process memory. Restart = lost jobs. `/api/progress/:jobId` means a 20-scene batch opens 20 streams.
+
+**Change:**
+- **Job Store** (SQLite table or JSON file) with states `queued → running → succeeded | failed`, idempotency keys, and `parentJobId` for batches
+- A single `/api/events` SSE stream per session carrying `{jobId, parentJobId, phase, progress}`, supporting `Last-Event-ID` for reconnect
+- `GET /api/jobs/:id` for cold reload
+
+**Why:** Generation jobs are slow and expensive. Losing them on a refresh or crash is a real cost, not just an annoyance.
+
+### 11. No explicit asset store
+
+**Problem:** `frameUrl`, `audioUrl`, `approvedRefUrl`, thumbnails — the diagram says "Local JSON Persistence," which can't hold blobs. Where do bytes live, and how do the batch worker and ZIP packager find them?
+
+**Change:** An explicit **Asset Store** (local `/data/assets` with content-addressed filenames, swappable for S3-compatible later) and reference assets by `assetId`, not URL. URLs are resolved at the edge.
+
+**Why:** Immutable, content-addressed assets are what make continuity references trustworthy and make project export trivially correct.
+
+### 12. Kit vs. project export are conflated
+
+**Problem:** "Creator Kit .zip" sounds like it's generated per project. But the Python pipeline is a stable template; the per-project part is the manifest + assets.
+
+**Change:** Two artifacts:
+- **Creator Kit** — versioned, static template (Flask + MoviePy + ffmpeg + Whisper + TTS adapters, `run.sh/.bat`, `.env.example`, `.gitignore`, README, pytest), built once per release
+- **Project Bundle** — `manifest.json` + assets + motion-prompt `.txt`, generated per episode
+
+The kit's `README` says: drop a project bundle into `/projects` and run.
+
+**Why:** Kit stays small and testable; project bundles stay portable; creators can upgrade the kit without losing projects.
+
+### 13. Shared schema as a single source of truth
+
+**Problem:** Scene schema is defined in prose. Client, server, and Python kit will each re-type it and drift.
+
+**Change:** A `@studio/contracts` package: Zod schemas → TypeScript types (client + server) → JSON Schema (validated by the Python kit via `jsonschema`). Version it (`schemaVersion`).
+
+**Why:** One definition, three consumers, zero drift.
+
+### 14. Minor but worth fixing
+- Top bar says 5 stage links; there are 6 modules. Decide whether Batch/Kit is a stage or a utility.
+- No mention of upload limits, rate limits, or cost guardrails. For a hosted studio used by "creators worldwide" these are required; if it's single-user local, state that explicitly as an architectural assumption.
+- Add usage/cost telemetry per episode (tokens, images, TTS characters) — cheap now, painful to retrofit.
+
+---
+
+## Part 3: Enhanced Architecture & Component Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                          BROWSER STUDIO  (React + Tailwind)                          │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  Shell: Wordmark · Stage Nav (6) · Output Profile Picker (9:16 / 16:9 / both)  │  │
+│  │         · Job Tray (live progress) · Render / Export CTA                        │  │
+│  └────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                      │
+│  ┌──────────────────────────┐    ┌──────────────────────────────────────────────┐    │
+│  │   CLIENT STATE (3 stores)│    │               STAGE MODULES                  │    │
+│  │ ┌──────────────────────┐ │    │ 1. Bible & Cast  (Roster · Aliases · Voice  │    │
+│  │ │ Canon Cache          │ │    │    Profiles · Chapter Log · WKW Ledger view) │    │
+│  │ │  pinned bibleVersion │ │    │ 2. Script  (Chapter In · Generate · Audit   │    │
+│  │ │  read-mostly mirror  │ │    │    vs Canon · Carry-Forward Diff Review)     │    │
+│  │ ├──────────────────────┤ │◄──►│ 3. Continuity Gate  (Unregistered chars →   │    │
+│  │ │ Episode Workspace    │ │    │    3 candidate portraits → Approve/Register; │    │
+│  │ │  active script/scenes│ │    │    Location plates · Wardrobe · Color grade) │    │
+│  │ │  autosave, client-   │ │    │ 4. Visuals  (Scene frames per profile ·      │    │
+│  │ │  owned draft         │ │    │    Thumbnails · Provenance view · Regen)     │    │
+│  │ ├──────────────────────┤ │    │ 5. Audio  (Voice casting · TTS · Whisper SRT │    │
+│  │ │ Job Mirror           │ │    │    · waveform/timing)                        │    │
+│  │ │  subscribed, never   │ │    │ 6. Preview, Render & Export  (Canvas preview │    │
+│  │ │  source of truth     │ │    │    of Render Manifest · Motion .txt · Project│    │
+│  │ └──────────────────────┘ │    │    Bundle · Creator Kit download · Batch)    │    │
+│  └────────────┬─────────────┘    └──────────────────────┬───────────────────────┘    │
+└───────────────┼───────────────────────────────────────────┼──────────────────────────┘
+                │   REST (validated by shared Zod schemas)  │   SSE  /api/events
+                │   GET /api/jobs/:id for cold reload       │   (Last-Event-ID resume)
+                ▼                                           ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                           EXPRESS API SERVER  (Port 3000)                            │
+│                                                                                      │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ EDGE: Routes · Schema Validation · Upload Limits · Rate Limit · Asset URL       │  │
+│  │       Resolver · SSE Hub · (Auth/Quota if hosted)                               │  │
+│  └────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                      │
+│  ┌───────────────────────────────── DOMAIN SERVICES ─────────────────────────────┐   │
+│  │ ┌─────────────────┐ ┌───────────────────┐ ┌─────────────────┐ ┌─────────────┐ │   │
+│  │ │ Script Service  │ │ Canon &           │ │ Character       │ │ Visual      │ │   │
+│  │ │ chapter→script  │ │ Continuity Svc    │ │ Registry        │ │ Service     │ │   │
+│  │ │ scene schema    │ │ bibleVersion      │ │ detect+alias    │ │ Continuity  │ │   │
+│  │ │ uses canon@ver  │ │ WKW ledger        │ │ resolve         │ │ Pack        │ │   │
+│  │ │ emits charsPres.│ │ canon audit       │ │ candidate       │ │ Prompt      │ │   │
+│  │ │                 │ │ carry-fwd diff    │ │ portraits       │ │ Assembler   │ │   │
+│  │ │                 │ │ accept/reject     │ │ adult policy    │ │ frames per  │ │   │
+│  │ │                 │ │                   │ │ approve+register│ │ profile     │ │   │
+│  │ │                 │ │                   │ │                 │ │ thumbnails  │ │   │
+│  │ │                 │ │                   │ │                 │ │ provenance  │ │   │
+│  │ └─────────────────┘ └───────────────────┘ └─────────────────┘ └─────────────┘ │   │
+│  │ ┌─────────────────┐ ┌───────────────────┐ ┌───────────────────────────────┐   │   │
+│  │ │ Voice Service   │ │ Export Service    │ │ Kit Service                   │   │   │
+│  │ │ Voice Map       │ │ Render Manifest   │ │ versioned static kit template │   │   │
+│  │ │ (per provider)  │ │ Motion-prompt .txt│ │ Secret Scrub Gate (regex +    │   │   │
+│  │ │ TTS dispatch    │ │ Project Bundle    │ │   test; fails build on hit)   │   │   │
+│  │ │ Whisper → SRT   │ │ (manifest+assets) │ │ README/.env.example/run.*    │   │   │
+│  │ └─────────────────┘ └───────────────────┘ └───────────────────────────────┘   │   │
+│  └───────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                      │
+│  ┌──────────────────────────────────┐  ┌────────────────────────────────────────┐    │
+│  │ JOB ENGINE                       │  │ PROVIDER ADAPTERS  (retry · rate-limit │    │
+│  │ Job Store (durable, SQLite/JSON) │  │  · normalize · cost/usage telemetry)   │    │
+│  │ states: queued→running→done/fail │  │  Gemini Text  │ Gemini Image │ Gemini  │    │
+│  │ parentJobId for batches          │  │  TTS          │ ElevenLabs   │ Whisper │    │
+│  │ idempotency keys · resumable     │  │                                        │    │
+│  │ Worker Pool  →  Event Bus → SSE  │  │  (keys only here, read from .env)      │    │
+│  └──────────────────────────────────┘  └────────────────────────────────────────┘    │
+│                                                                                      │
+│  ┌──────────────────────────────────┐  ┌────────────────────────────────────────┐    │
+│  │ PROJECT DB                       │  │ ASSET STORE                            │    │
+│  │ series · canon versions · WKW    │  │ /data/assets/<sha>.{png,mp3,srt}       │    │
+│  │ ledger · episodes · scenes ·     │  │ content-addressed, immutable;          │    │
+│  │ provenance · jobs · usage        │  │ swappable for S3-compatible            │    │
+│  └──────────────────────────────────┘  └────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                │                                           │
+                │  Project Bundle (.zip)                    │  Creator Kit (.zip, versioned)
+                │  manifest.json + assets + motion.txt      │  template, no project data
+                ▼                                           ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                     PYTHON CREATOR KIT  (standalone, secret-free)                    │
+│  Flask UI · manifest validator (JSON Schema) · MoviePy/ffmpeg renderer · Whisper     │
+│  · TTS adapters (Edge-TTS / ElevenLabs via creator's own .env) · run.sh/.bat ·        │
+│  .env.example · .gitignore · README · pytest (incl. secret-scan test)                │
+│  Consumes:  /projects/<bundle>/manifest.json  →  Produces:  final .mp4 per profile   │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+══════════════════════════════════════════════════════════════════════════════════════
+  SHARED CONTRACTS  (@studio/contracts)  — single source of truth, versioned
+  Zod → TS types (client+server)  ·  JSON Schema (Python kit)
+  Scene · Character · ContinuityPack · RenderManifest · Job · WKWEntry · Provenance
+══════════════════════════════════════════════════════════════════════════════════════
+```
+
+---
+
+## Part 4: Updated Data Model (deltas only)
+
+```
+Character {
+  id, name, age, role, goal, secret,
+  aliases: string[],                        // NEW — resolver input
+  wardrobeIds: string[],                    // CHANGED — per-scene wardrobe possible
+  voiceProfile: {                           // CHANGED — provider-aware
+    elevenlabs?: string, gemini?: string, edgeTts?: string, style?: {...}
+  },
+  approvedRefAssetId,                       // CHANGED — assetId not URL
+  registeredInChapter, bibleVersionAdded    // NEW — canon provenance
+}
+
+CanonVersion { version, createdAt, sourceChapterId, diff: {added[], changed[]} }
+
+WKWEntry { chapterId, sceneId?, characterId, factId, knows: boolean, revealedAt }  // append-only
+
+Scene {
+  ...existing fields...,
+  charactersPresent: characterId[],         // resolved IDs, never raw names
+  continuityPackHash,                       // NEW
+  renders: {                                // CHANGED — per output profile
+    "9x16": { frameAssetId, thumbnailAssetIds[], provenance },
+    "16x9": { frameAssetId, thumbnailAssetIds[], provenance }
+  },
+  audioAssetId, srtAssetId, durationMs
+}
+
+Episode { id, chapterId, bibleVersion, renderTargets[], status, scenes[] }
+
+Provenance { model, promptHash, continuityPackHash, refAssetIds[], seed?, createdAt, costUnits }
+
+Job { id, parentJobId?, type, status, progress, idempotencyKey, input, outputAssetIds[], error? }
+
+RenderManifest { schemaVersion, episodeId, bibleVersion, outputProfile, scenes[], thumbnails[], style }
+```
+
+---
+
+## Part 5: Summary of changes and why (quick reference)
+
+| # | Change | Primary reason |
+|---|---|---|
+| 1 | Split client store into Canon Cache / Episode Workspace / Job Mirror | Different lifecycles; server owns jobs |
+| 2 | Canon versioning + WKW as append-only ledger + reviewable carry-forward | Continuity becomes auditable and reversible |
+| 3 | Character Registry as a service; detect at script time; alias resolution | Onboarding is a canon event, not an image side effect |
+| 4 | Continuity Pack + Prompt Assembler + per-frame provenance | Deterministic look; reproducible frames |
+| 5 | Aspect → Output Profile on assets, not a global toggle | Prevents cross-format asset mismatch; enables dual-format |
+| 6 | **Render Manifest** as the browser↔kit contract | Two renderers, one input; true portability |
+| 7 | Domain Services vs. Provider Adapters | Swappability, testability, one place for cost telemetry |
+| 8 | Move Motion .txt to Export; replace "GitHub Hygiene" with Secret Scrub Gate | Right responsibility, enforceable guarantee |
+| 9 | Provider-aware `voiceProfile` + Voice Map | ElevenLabs/Gemini/Edge-TTS IDs aren't interchangeable |
+| 10 | Durable Job Store, single SSE hub with resume, `GET /jobs/:id` | Slow expensive jobs must survive refresh/restart |
+| 11 | Explicit content-addressed Asset Store; `assetId` over URL | Blobs need a home; immutability underpins continuity |
+| 12 | Separate Creator Kit (static, versioned) from Project Bundle (per episode) | Kit stays testable; projects stay portable |
+| 13 | `@studio/contracts` shared schemas | One definition for three consumers |
+
+---
+## Part 6: A little more context 
+Also we will need project folders for future stories other than Passions Peak 
+And a downloadable motion_prompts.txt sheet per episode with Voice over script included and timestamps
+
+gemini-3.1-flash-lite-image will be for scripts and images and 
+Lyria-3-clip-preview or lyria-3-pro-preview for BGM prompts must be generated in the pipeline based on the scene and what's going on in the scene to match the energy and vibe. 
+And we will not be using any of Google's TTS models because they are too expensive and we will use elevenlabs and voice ids for the characters. 
+Also Decision 4 — Native .txt Motion Prompts & Multi-Format Thumbnail Generator:
+Chosen Approach: Generate structured image-to-video motion instructions per shot (matching the user's Omni 1.2 Flash / Runway / Flow template: PRIMARY MOTION, CAMERA MOVEMENT, MOTION SPEED, SECONDARY MOTION, START/END STATE, TRANSITION HINT) and compile them into a downloadable <episode_slug>_motion_prompts.txt, paired with dedicated Gemini Thumbnail generation (9:16 vertical cover or 16:9 YouTube CTR thumbnail).
+Why: Supports creators who want to animate approved static keyframes externally in Omni 1.2 Flash without paying for automated video generation on every frame.
+
+
+The Gemini Thumbnail generation (9:16 vertical cover or 16:9 YouTube CTR thumbnail) should also be a tab in the studio it should not be separate outside the studio; this makes the whole process simple for anyone. 
+
+---
+## Part 7: Suggested order of adoption
+
+You don't need to do all of this at once. If I were sequencing it for maximum risk reduction per hour:
+
+1. **Shared contracts + Render Manifest** — unlocks the kit, prevents schema drift, and forces the rest into shape
+2. **Asset Store + assetIds** — everything downstream (provenance, bundles, kit) depends on it
+3. **Durable Job Store + SSE hub** — stops losing paid generation work
+4. **Canon versioning + WKW ledger** — your core product promise is continuity; make it structural
+5. **Character Registry with aliases, moved to script-time** — the "automatic onboarding" feature becomes reliable
+6. **Services/Adapters split** — refactor once the above has clarified where logic belongs
+7. **Output Profile on assets** — do this before you have a large library of 9:16-only frames
+
+Everything here keeps the product exactly what you described — a browser studio preloaded with the Passions Peak bible, sequential chapter-to-script, automatic character onboarding, reference-first visuals, dual TTS, thumbnails, motion-prompt sheets, and a secret-free Python kit. What changes is that the architecture now *enforces* those promises rather than relying on them being honored by convention.

@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --bg-canvas: #0F172A;
+    --bg-surface: #1E293B;
+    --bg-surface-elevated: #263348;
+    --border-subtle: #334155;
+    --text-primary: #F8FAFC;
+    --text-secondary: #94A3B8;
+    --accent-primary: #D97706;
+    --accent-hover: #F59E0B;
+    --status-nominal: #16A34A;
+    --status-warning: #D97706;
+    --status-error: #DC2626;
+  }
+
+  body {
+    font-family: "DM Sans", system-ui, -apple-system, sans-serif;
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    letter-spacing: 0.005em;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+    text-wrap: balance;
+  }
+
+  .font-mono-tabular {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle dark scrollbar for studio panels */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0F172A;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
